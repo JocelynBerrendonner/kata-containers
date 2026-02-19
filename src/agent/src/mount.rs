@@ -9,9 +9,12 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::ops::Deref;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use kata_sys_util::mount::{get_linux_mount_info, parse_mount_options};
+use nix::errno::Errno;
 use nix::mount::MsFlags;
 use regex::Regex;
 use slog::Logger;
@@ -129,25 +132,117 @@ pub fn is_mounted(mount_point: &str) -> Result<bool> {
     Ok(found)
 }
 
+/// Maximum time to wait for a transient devtmpfs mount failure to resolve.
+const DEV_MOUNT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Initial retry back-off interval.
+const DEV_MOUNT_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+/// Cap on the exponential back-off.
+const DEV_MOUNT_MAX_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Returns `true` for errno values that are expected to be transient when
+/// mounting devtmpfs early in boot (e.g. Cloud Hypervisor + virtio-blk
+/// timing). Non-transient errors such as `EINVAL` (kernel lacks devtmpfs),
+/// `EPERM`, and `EACCES` cause an immediate failure.
+fn is_transient_mount_errno(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::ENODEV | Errno::ENOENT | Errno::EAGAIN | Errno::EBUSY
+    )
+}
+
+/// Mount devtmpfs to `/dev` with bounded retry for transient errors.
+///
+/// Cloud Hypervisor can start the guest agent before devtmpfs is fully
+/// registered in the kernel, causing the first mount attempt to fail with
+/// a transient errno. This function retries with exponential back-off
+/// (capped at [`DEV_MOUNT_MAX_BACKOFF`]) until the mount succeeds, a
+/// non-transient error is observed, or [`DEV_MOUNT_TIMEOUT`] expires.
+///
+/// For QEMU (and any hypervisor where devtmpfs is ready by the time the
+/// agent starts) the first attempt succeeds and no retry occurs.
+#[instrument]
+fn mount_dev_with_retry(logger: &Logger, m: &InitMount) -> Result<()> {
+    let (flags, options) = parse_mount_options(&m.options)?;
+    let source = Path::new(m.src);
+    let dest = Path::new(m.dest);
+
+    // Fast path: already mounted (matches baremount behaviour).
+    let dest_str = dest.to_string_lossy();
+    if let Ok(info) = get_linux_mount_info(dest_str.deref()) {
+        if info.fs_type == m.fstype {
+            slog_info!(logger, "devtmpfs already mounted at {:?}", dest);
+            return Ok(());
+        }
+    }
+
+    let deadline = Instant::now() + DEV_MOUNT_TIMEOUT;
+    let mut backoff = DEV_MOUNT_INITIAL_BACKOFF;
+
+    loop {
+        match nix::mount::mount(
+            Some(source),
+            dest,
+            Some(m.fstype),
+            flags,
+            Some(options.as_str()),
+        ) {
+            Ok(()) => {
+                info!(logger, "successfully mounted {} to {}", m.src, m.dest);
+                return Ok(());
+            }
+            Err(errno) => {
+                // Non-transient errors are genuine misconfigurations — fail
+                // immediately so that they are not masked by a retry loop.
+                if !is_transient_mount_errno(errno) {
+                    return Err(anyhow!(
+                        "failed to mount {} to {} ({}): error is not transient, giving up",
+                        m.src,
+                        m.dest,
+                        errno
+                    ));
+                }
+
+                if Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "timed out after {:?} trying to mount {} to {}: last error: {}",
+                        DEV_MOUNT_TIMEOUT,
+                        m.src,
+                        m.dest,
+                        errno
+                    ));
+                }
+
+                warn!(
+                    logger,
+                    "transient error mounting {} to {}: {} — retrying in {:?}",
+                    m.src,
+                    m.dest,
+                    errno,
+                    backoff
+                );
+
+                thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, DEV_MOUNT_MAX_BACKOFF);
+            }
+        }
+    }
+}
+
 #[instrument]
 fn mount_to_rootfs(logger: &Logger, m: &InitMount) -> Result<()> {
     fs::create_dir_all(m.dest).context("could not create directory")?;
+
+    // devtmpfs may not be ready immediately under Cloud Hypervisor.
+    // Use a dedicated retry path that preserves the raw errno.
+    if m.src == "dev" && m.fstype == "devtmpfs" {
+        return mount_dev_with_retry(logger, m);
+    }
 
     let (flags, options) = parse_mount_options(&m.options)?;
     let source = Path::new(m.src);
     let dest = Path::new(m.dest);
 
-    baremount(source, dest, m.fstype, flags, &options, logger).or_else(|e| {
-        if m.src == "dev" {
-            error!(
-                logger,
-                "Could not mount filesystem from {} to {}", m.src, m.dest
-            );
-            Ok(())
-        } else {
-            Err(e)
-        }
-    })
+    baremount(source, dest, m.fstype, flags, &options, logger)
 }
 
 #[instrument]
