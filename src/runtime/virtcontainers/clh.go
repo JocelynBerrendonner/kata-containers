@@ -73,17 +73,17 @@ const (
 const (
 	// Values are mandatory by http API
 	// Values based on:
-	clhTimeout                     = 10
-	clhAPITimeout                  = 1
-	clhAPITimeoutConfidentialGuest = 20
+	clhTimeout                     = 10000
+	clhAPITimeout                  = 1000
+	clhAPITimeoutConfidentialGuest = 20000
 	// Minimum timout for calling CreateVM followed by BootVM. Executing these two APIs
 	// might take longer than the value returned by getClhAPITimeout().
-	clhCreateAndBootVMMinimumTimeout = 10
+	clhCreateAndBootVMMinimumTimeout = 10000
 	// Timeout for hot-plug - hotplug devices can take more time, than usual API calls
 	// Use longer time timeout for it.
-	clhHotPlugAPITimeout                   = 5
-	clhStopSandboxTimeout                  = 3
-	clhStopSandboxTimeoutConfidentialGuest = 10
+	clhHotPlugAPITimeout                   = 5000
+	clhStopSandboxTimeout                  = 30
+	clhStopSandboxTimeoutConfidentialGuest = 100
 	clhSocket                              = "clh.sock"
 	clhAPISocket                           = "clh-api.sock"
 	virtioFsSocket                         = "virtiofsd.sock"

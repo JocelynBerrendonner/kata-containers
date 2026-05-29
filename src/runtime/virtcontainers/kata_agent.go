@@ -87,10 +87,10 @@ const (
 type customRequestTimeoutKeyType struct{}
 
 var (
-	checkRequestTimeout              = 30 * time.Second
-	createContainerRequestTimeout    = 60 * time.Second
-	defaultRequestTimeout            = 60 * time.Second
-	remoteRequestTimeout             = 300 * time.Second
+	checkRequestTimeout              = 30000 * time.Second
+	createContainerRequestTimeout    = 60000 * time.Second
+	defaultRequestTimeout            = 60000 * time.Second
+	remoteRequestTimeout             = 3000 * time.Second
 	customRequestTimeoutKey          = customRequestTimeoutKeyType(struct{}{})
 	errorMissingOCISpec              = errors.New("Missing OCI specification")
 	defaultKataHostSharedDir         = "/run/kata-containers/shared/sandboxes/"
