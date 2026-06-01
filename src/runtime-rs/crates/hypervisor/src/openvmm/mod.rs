@@ -36,13 +36,19 @@ pub(crate) const OPENVMM_NET_PCI_PORT: &str = "rp2";
 pub(crate) const OPENVMM_VSOCK_PCI_PORT: &str = "rp3";
 pub(crate) const OPENVMM_CONSOLE_PCI_PORT: &str = "rp4";
 pub(crate) const OPENVMM_STATIC_PCI_PORT_COUNT: u8 = 5;
+/// Prefix for hot-plug PCIe root ports used for runtime block device
+/// attach (e.g. additional container rootfs, CSI block volumes).
 pub(crate) const OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX: &str = "hp";
-pub(crate) const OPENVMM_BLOCK_HOTPLUG_PORT_COUNT: u8 = 24;
-/// Number of pre-reserved PCIe root ports for cold-plug VFIO pass-through
-/// devices (e.g., GPUs, NVSwitches). These ports are created with
-/// `hotplug: false` so the guest sees the assigned devices at boot.
+/// Prefix for cold-plug VFIO PCIe root ports (e.g., GPUs, NVSwitches).
+/// These are created on demand with `hotplug: false` so the guest sees
+/// the assigned devices at boot.
 pub(crate) const OPENVMM_VFIO_COLDPLUG_PORT_PREFIX: &str = "vfio";
-pub(crate) const OPENVMM_VFIO_COLDPLUG_PORT_COUNT: u8 = 16;
+/// OpenVMM's `GenericPcieRootComplex` packs root ports at device-number
+/// stride 8 within bus 0, so it hard-asserts `i * 8 <= 0xff` — i.e. at
+/// most 32 ports per complex (a PCIe bus only has 32 device slots). We
+/// split that budget between the static ports, on-demand VFIO cold-plug
+/// ports, and a block-hotplug pool sized to fill the remainder.
+pub(crate) const OPENVMM_MAX_PCIE_ROOT_PORTS: u8 = 32;
 
 /// The OpenVMM hypervisor struct, wrapping inner state behind a lock.
 pub struct OpenVmm {

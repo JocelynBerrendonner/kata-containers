@@ -14,9 +14,9 @@ use std::{
 use super::inner::OpenVmmInner;
 use super::vmm_instance::DeferredNetworkDevice;
 use super::{
-    OPENVMM_BLOCK_HOTPLUG_PORT_COUNT, OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, OPENVMM_CONSOLE_PCI_PORT,
+    OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, OPENVMM_CONSOLE_PCI_PORT, OPENVMM_MAX_PCIE_ROOT_PORTS,
     OPENVMM_NET_PCI_PORT, OPENVMM_ROOTFS_PCI_PORT, OPENVMM_SHAREFS_PCI_PORT,
-    OPENVMM_VFIO_COLDPLUG_PORT_COUNT, OPENVMM_VFIO_COLDPLUG_PORT_PREFIX,
+    OPENVMM_STATIC_PCI_PORT_COUNT, OPENVMM_VFIO_COLDPLUG_PORT_PREFIX,
 };
 use crate::kernel_param::KernelParams;
 use crate::utils::{get_jailer_root, get_sandbox_path};
@@ -60,7 +60,7 @@ impl OpenVmmInner {
         self.id = id.to_string();
         self.state = VmmState::NotReady;
         self.pending_devices.clear();
-        self.reset_block_hotplug_ports();
+        self.clear_block_hotplug_ports();
         self.vm_path = get_sandbox_path(id);
         self.jailer_root = get_jailer_root(id);
         self.netns = netns;
@@ -76,7 +76,53 @@ impl OpenVmmInner {
 
     pub(crate) async fn start_vm(&mut self, _timeout: i32) -> Result<()> {
         info!(sl!(), "openvmm: start_vm");
-        self.reset_block_hotplug_ports();
+
+        // Count VFIO devices up front so we can divide the PCIe root-complex
+        // budget between cold-plug (VFIO) and hot-plug (block) ports.
+        // OpenVMM's root complex caps out at OPENVMM_MAX_PCIE_ROOT_PORTS
+        // (one per device slot on bus 0); we give VFIO exactly what it
+        // needs and let block hotplug consume the remainder.
+        let n_vfio_devices_usize: usize = self
+            .pending_devices
+            .iter()
+            .map(|d| match d {
+                crate::DeviceType::Vfio(v) => v
+                    .devices
+                    .iter()
+                    .filter(|h| !h.bus_slot_func.is_empty())
+                    .count(),
+                _ => 0,
+            })
+            .sum();
+        let n_vfio_ports: u8 = u8::try_from(n_vfio_devices_usize).map_err(|_| {
+            anyhow!(
+                "openvmm: too many VFIO devices pending ({}), max {}",
+                n_vfio_devices_usize,
+                u8::MAX
+            )
+        })?;
+        let budget_for_dynamic_ports = OPENVMM_MAX_PCIE_ROOT_PORTS
+            .checked_sub(OPENVMM_STATIC_PCI_PORT_COUNT)
+            .expect("OPENVMM_STATIC_PCI_PORT_COUNT must not exceed OPENVMM_MAX_PCIE_ROOT_PORTS");
+        let n_hotplug_ports = budget_for_dynamic_ports.checked_sub(n_vfio_ports).ok_or_else(|| {
+            anyhow!(
+                "openvmm: {} VFIO devices exceed PCIe root-port budget ({} static + {} VFIO > {} total)",
+                n_vfio_ports,
+                OPENVMM_STATIC_PCI_PORT_COUNT,
+                n_vfio_ports,
+                OPENVMM_MAX_PCIE_ROOT_PORTS
+            )
+        })?;
+        info!(
+            sl!(),
+            "openvmm: PCIe root ports: {} static + {} block-hotplug + {} VFIO cold-plug = {}",
+            OPENVMM_STATIC_PCI_PORT_COUNT,
+            n_hotplug_ports,
+            n_vfio_ports,
+            OPENVMM_STATIC_PCI_PORT_COUNT + n_hotplug_ports + n_vfio_ports
+        );
+        // (Re)populate the block-hotplug free pool now that we know its size.
+        self.populate_block_hotplug_ports(n_hotplug_ports);
 
         let cmdline = build_kernel_cmdline(
             self.config.debug_info.enable_debug,
@@ -188,7 +234,7 @@ impl OpenVmmInner {
                     },
                 ];
 
-                for index in 0..OPENVMM_BLOCK_HOTPLUG_PORT_COUNT {
+                for index in 0..n_hotplug_ports {
                     ports.push(PcieRootPortConfig {
                         name: format!("{}{}", OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, index),
                         hotplug: true,
@@ -196,10 +242,10 @@ impl OpenVmmInner {
                 }
 
                 // Cold-plug ports for VFIO PCI pass-through (GPUs, NVSwitches,
-                // InfiniBand VFs). These are always created so the OpenVMM
-                // root-complex layout is stable; unused ones simply appear
-                // empty in the guest.
-                for index in 0..OPENVMM_VFIO_COLDPLUG_PORT_COUNT {
+                // InfiniBand VFs). Allocated on demand so the root complex
+                // stays within the OPENVMM_MAX_PCIE_ROOT_PORTS budget when no
+                // VFIO devices are assigned.
+                for index in 0..n_vfio_ports {
                     ports.push(PcieRootPortConfig {
                         name: format!("{}{}", OPENVMM_VFIO_COLDPLUG_PORT_PREFIX, index),
                         hotplug: false,
@@ -375,10 +421,11 @@ impl OpenVmmInner {
                             continue;
                         }
 
-                        if next_vfio_port >= OPENVMM_VFIO_COLDPLUG_PORT_COUNT {
+                        if next_vfio_port >= n_vfio_ports {
                             return Err(anyhow!(
-                                "openvmm: too many VFIO devices (limit {}), cannot cold-plug BDF {}",
-                                OPENVMM_VFIO_COLDPLUG_PORT_COUNT,
+                                "openvmm: VFIO port accounting mismatch (limit {}), \
+                                 cannot cold-plug BDF {}",
+                                n_vfio_ports,
                                 hostdev.bus_slot_func
                             ));
                         }

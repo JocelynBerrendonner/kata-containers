@@ -16,10 +16,7 @@ use kata_types::{
 use tokio::sync::mpsc;
 
 use super::vmm_instance::VmmInstance;
-use super::{
-    OPENVMM_BLOCK_HOTPLUG_PORT_COUNT, OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX,
-    OPENVMM_STATIC_PCI_PORT_COUNT,
-};
+use super::{OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, OPENVMM_STATIC_PCI_PORT_COUNT};
 use crate::device::pci_path::{PciPath, PciSlot};
 
 #[derive(Clone, Debug)]
@@ -84,7 +81,7 @@ impl OpenVmmInner {
             run_dir: String::new(),
             pending_devices: Vec::new(),
             cached_block_devices: HashSet::new(),
-            free_block_hotplug_ports: Self::default_block_hotplug_ports(),
+            free_block_hotplug_ports: VecDeque::new(),
             attached_block_hotplug_ports: HashMap::new(),
             capabilities,
             guest_memory_block_size_mb: 0,
@@ -140,12 +137,22 @@ impl OpenVmmInner {
         inner.config = state.config;
         inner.run_dir = state.run_dir;
         inner.cached_block_devices = state.cached_block_devices;
-        inner.reset_block_hotplug_ports();
+        inner.clear_block_hotplug_ports();
         Ok(inner)
     }
 
-    pub(crate) fn reset_block_hotplug_ports(&mut self) {
-        self.free_block_hotplug_ports = Self::default_block_hotplug_ports();
+    /// Drop any tracked hotplug-port reservations. The free pool itself is
+    /// (re)built by `start_vm` once the VFIO device count is known and the
+    /// remaining root-complex budget can be computed.
+    pub(crate) fn clear_block_hotplug_ports(&mut self) {
+        self.free_block_hotplug_ports.clear();
+        self.attached_block_hotplug_ports.clear();
+    }
+
+    /// Populate the block-hotplug free pool with `count` ports. Called by
+    /// `start_vm` after the VFIO/static port budget is finalized.
+    pub(crate) fn populate_block_hotplug_ports(&mut self, count: u8) {
+        self.free_block_hotplug_ports = (0..count).map(OpenVmmHotplugPort::new).collect();
         self.attached_block_hotplug_ports.clear();
     }
 
@@ -175,11 +182,5 @@ impl OpenVmmInner {
         let port = self.attached_block_hotplug_ports.remove(device_id)?;
         self.free_block_hotplug_ports.push_front(port.clone());
         Some(port)
-    }
-
-    fn default_block_hotplug_ports() -> VecDeque<OpenVmmHotplugPort> {
-        (0..OPENVMM_BLOCK_HOTPLUG_PORT_COUNT)
-            .map(OpenVmmHotplugPort::new)
-            .collect()
     }
 }
