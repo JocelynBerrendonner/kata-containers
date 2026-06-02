@@ -14,9 +14,9 @@ use std::{
 use super::inner::OpenVmmInner;
 use super::vmm_instance::DeferredNetworkDevice;
 use super::{
-    OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, OPENVMM_CONSOLE_PCI_PORT, OPENVMM_MAX_PCIE_ROOT_PORTS,
-    OPENVMM_NET_PCI_PORT, OPENVMM_ROOTFS_PCI_PORT, OPENVMM_SHAREFS_PCI_PORT,
-    OPENVMM_STATIC_PCI_PORT_COUNT, OPENVMM_VFIO_COLDPLUG_PORT_PREFIX,
+    OPENVMM_BLOCK_HOTPLUG_PORT_COUNT, OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, OPENVMM_CONSOLE_PCI_PORT,
+    OPENVMM_HARD_MAX_ROOT_PORTS, OPENVMM_NET_PCI_PORT, OPENVMM_ROOTFS_PCI_PORT,
+    OPENVMM_SHAREFS_PCI_PORT, OPENVMM_STATIC_PCI_PORT_COUNT, OPENVMM_VFIO_COLDPLUG_PORT_PREFIX,
 };
 use crate::kernel_param::KernelParams;
 use crate::utils::{get_jailer_root, get_sandbox_path};
@@ -24,8 +24,8 @@ use crate::{MemoryConfig, VcpuThreadIds, VmmState, VM_ROOTFS_DRIVER_BLK};
 
 use openvmm_defs::config::{
     Config, DeviceVtl, HypervisorConfig as OvmmHypervisorConfig, LoadMode,
-    MemoryConfig as OvmmMemoryConfig, PcieDeviceConfig, PcieRootComplexConfig, PcieRootPortConfig,
-    ProcessorTopologyConfig, VmbusConfig, DEFAULT_MMIO_GAPS_X86,
+    MemoryConfig as OvmmMemoryConfig, PcieDeviceConfig, PcieMmioRangeConfig,
+    PcieRootComplexConfig, PcieRootPortConfig, ProcessorTopologyConfig, VmbusConfig,
 };
 use vm_resource::kind::VmbusDeviceHandleKind;
 use vm_resource::IntoResource;
@@ -84,11 +84,11 @@ impl OpenVmmInner {
     pub(crate) async fn start_vm(&mut self, _timeout: i32) -> Result<()> {
         info!(sl!(), "openvmm: start_vm");
 
-        // Count VFIO devices up front so we can divide the PCIe root-complex
-        // budget between cold-plug (VFIO) and hot-plug (block) ports.
-        // OpenVMM's root complex caps out at OPENVMM_MAX_PCIE_ROOT_PORTS
-        // (one per device slot on bus 0); we give VFIO exactly what it
-        // needs and let block hotplug consume the remainder.
+        // Count VFIO devices up front so we can size the cold-plug portion
+        // of the PCIe root complex. The block-hotplug pool is fixed-size
+        // (OPENVMM_BLOCK_HOTPLUG_PORT_COUNT); openvmm's
+        // `GenericPcieRootComplex` allows up to OPENVMM_HARD_MAX_ROOT_PORTS
+        // total ports per complex, so we just sanity-check the sum.
         let n_vfio_devices_usize: usize = self
             .pending_devices
             .iter()
@@ -101,34 +101,37 @@ impl OpenVmmInner {
                 _ => 0,
             })
             .sum();
-        let n_vfio_ports: u8 = u8::try_from(n_vfio_devices_usize).map_err(|_| {
-            anyhow!(
-                "openvmm: too many VFIO devices pending ({}), max {}",
-                n_vfio_devices_usize,
-                u8::MAX
-            )
-        })?;
-        let budget_for_dynamic_ports = OPENVMM_MAX_PCIE_ROOT_PORTS
-            .checked_sub(OPENVMM_STATIC_PCI_PORT_COUNT)
-            .expect("OPENVMM_STATIC_PCI_PORT_COUNT must not exceed OPENVMM_MAX_PCIE_ROOT_PORTS");
-        let n_hotplug_ports = budget_for_dynamic_ports.checked_sub(n_vfio_ports).ok_or_else(|| {
-            anyhow!(
-                "openvmm: {} VFIO devices exceed PCIe root-port budget ({} static + {} VFIO > {} total)",
-                n_vfio_ports,
+        let n_hotplug_ports = OPENVMM_BLOCK_HOTPLUG_PORT_COUNT;
+        let total_ports: u16 = u16::from(OPENVMM_STATIC_PCI_PORT_COUNT)
+            + u16::from(n_hotplug_ports)
+            + u16::try_from(n_vfio_devices_usize).map_err(|_| {
+                anyhow!(
+                    "openvmm: too many VFIO devices pending ({})",
+                    n_vfio_devices_usize
+                )
+            })?;
+        if total_ports > OPENVMM_HARD_MAX_ROOT_PORTS {
+            return Err(anyhow!(
+                "openvmm: PCIe root-port count {} exceeds hard cap {} ({} static + {} block-hotplug + {} VFIO cold-plug)",
+                total_ports,
+                OPENVMM_HARD_MAX_ROOT_PORTS,
                 OPENVMM_STATIC_PCI_PORT_COUNT,
-                n_vfio_ports,
-                OPENVMM_MAX_PCIE_ROOT_PORTS
-            )
-        })?;
+                n_hotplug_ports,
+                n_vfio_devices_usize,
+            ));
+        }
+        let n_vfio_ports: u16 = total_ports
+            - u16::from(OPENVMM_STATIC_PCI_PORT_COUNT)
+            - u16::from(n_hotplug_ports);
         info!(
             sl!(),
             "openvmm: PCIe root ports: {} static + {} block-hotplug + {} VFIO cold-plug = {}",
             OPENVMM_STATIC_PCI_PORT_COUNT,
             n_hotplug_ports,
             n_vfio_ports,
-            OPENVMM_STATIC_PCI_PORT_COUNT + n_hotplug_ports + n_vfio_ports
+            total_ports
         );
-        // (Re)populate the block-hotplug free pool now that we know its size.
+        // (Re)populate the block-hotplug free pool.
         self.populate_block_hotplug_ports(n_hotplug_ports);
 
         let cmdline = build_kernel_cmdline(
@@ -187,19 +190,25 @@ impl OpenVmmInner {
         let serial_ports: [Option<vm_resource::Resource<vm_resource::kind::SerialBackendHandle>>;
             4] = [None, None, None, None];
 
-        // Build chipset via VmManifestBuilder
+        // Build chipset via VmManifestBuilder. We must grab the default
+        // LayoutConfig (chipset MMIO sizing) from the builder before
+        // consuming it with `.build()`, since openvmm 701752c9 split this
+        // out from MemoryConfig into a separate Config.layout field.
+        let chipset_builder = vm_manifest_builder::VmManifestBuilder::new(
+            vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect,
+            vm_manifest_builder::MachineArch::X86_64,
+        )
+        .with_serial(serial_ports);
+        let layout_config = chipset_builder.layout_config();
         let vm_manifest_builder::VmChipsetResult {
             chipset,
             chipset_devices,
             pci_chipset_devices,
+            isa_dma_controller,
             capabilities: chipset_capabilities,
-        } = vm_manifest_builder::VmManifestBuilder::new(
-            vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect,
-            vm_manifest_builder::MachineArch::X86_64,
-        )
-        .with_serial(serial_ports)
-        .build()
-        .context("failed to build VM chipset manifest")?;
+        } = chipset_builder
+            .build()
+            .context("failed to build VM chipset manifest")?;
 
         // Memory config
         let mem_size_bytes = (self.config.memory_info.default_memory as u64)
@@ -208,35 +217,17 @@ impl OpenVmmInner {
 
         // PCIe root complex layout.
         //
-        // Absolute address ranges (intentionally generous; we may revisit
-        // these with the openvmm team to align with the
-        // `openvmm/openvmm_entry/src/lib.rs` reference pattern, which
-        // anchors the windows below/above `DEFAULT_MMIO_GAPS_X86`. For
-        // now keep the previous values — they are larger than John's
-        // recommendation (>= 512 MB low, >= 4 TB high) and shouldn't
-        // harm in the short run):
+        // Absolute address ranges (intentionally generous). With
+        // openvmm 701752c9 the ECAM window is no longer declared here;
+        // the layout engine derives it from start_bus/end_bus and
+        // allocates it dynamically. We keep `low_mmio`/`high_mmio` as
+        // fixed ranges so that VFIO BAR placement is predictable:
         //
-        //   ecam      = 0xe800_0000..0xf000_0000  (128 MB, 128 buses)
         //   low_mmio  = 0xc000_0000..0xe800_0000  (640 MB, 32-bit BARs)
         //   high_mmio = 0x0020_3d30_0000..0x200f_3d30_0000  (~125 TB,
         //                                                    64-bit
         //                                                    prefetchable
         //                                                    BARs)
-        //
-        // These windows sit outside `DEFAULT_MMIO_GAPS_X86` (low gap
-        // 0xf800_0000..0x1_0000_0000, high gap 0xf_e000_0000..0x10_0000_0000)
-        // and are non-overlapping when combined with them.
-        //
-        // CRITICAL: in addition to setting `low_mmio`/`high_mmio` on the
-        // root complex, we MUST also declare them in `pci_ecam_gaps` and
-        // `pci_mmio_gaps` on the MemoryConfig below.
-        // `MemoryLayout::new()` concatenates all three
-        // (mmio_gaps + pci_ecam_gaps + pci_mmio_gaps) when carving RAM
-        // around MMIO. Leaving them empty makes the memory layout treat
-        // our PCIe windows as RAM, which prevents the Linux PCI allocator
-        // from placing BARs and leaves them at GPA 0.
-        let ecam_range =
-            ovmm_memory_range::MemoryRange::new(0xe800_0000..0xf000_0000);
         let low_mmio_range =
             ovmm_memory_range::MemoryRange::new(0xc000_0000..0xe800_0000);
         let high_mmio_range = ovmm_memory_range::MemoryRange::new(
@@ -245,9 +236,7 @@ impl OpenVmmInner {
 
         info!(
             sl!(),
-            "openvmm: PCIe layout ecam={:#x}..{:#x} low_mmio={:#x}..{:#x} high_mmio={:#x}..{:#x}",
-            ecam_range.start(),
-            ecam_range.end(),
+            "openvmm: PCIe layout low_mmio={:#x}..{:#x} high_mmio={:#x}..{:#x}",
             low_mmio_range.start(),
             low_mmio_range.end(),
             high_mmio_range.start(),
@@ -260,30 +249,40 @@ impl OpenVmmInner {
             segment: 0,
             start_bus: 0,
             end_bus: 127,
-            ecam_range,
-            low_mmio: low_mmio_range,
-            high_mmio: high_mmio_range,
+            low_mmio: PcieMmioRangeConfig::Fixed(low_mmio_range),
+            high_mmio: PcieMmioRangeConfig::Fixed(high_mmio_range),
+            cxl: None,
             ports: {
                 let mut ports = vec![
                     PcieRootPortConfig {
                         name: OPENVMM_ROOTFS_PCI_PORT.to_string(),
                         hotplug: false,
+                        acs_capabilities_supported: None,
+                        cxl: false,
                     },
                     PcieRootPortConfig {
                         name: OPENVMM_SHAREFS_PCI_PORT.to_string(),
                         hotplug: false,
+                        acs_capabilities_supported: None,
+                        cxl: false,
                     },
                     PcieRootPortConfig {
                         name: OPENVMM_NET_PCI_PORT.to_string(),
                         hotplug: false,
+                        acs_capabilities_supported: None,
+                        cxl: false,
                     },
                     PcieRootPortConfig {
                         name: super::OPENVMM_VSOCK_PCI_PORT.to_string(),
                         hotplug: false,
+                        acs_capabilities_supported: None,
+                        cxl: false,
                     },
                     PcieRootPortConfig {
                         name: OPENVMM_CONSOLE_PCI_PORT.to_string(),
                         hotplug: false,
+                        acs_capabilities_supported: None,
+                        cxl: false,
                     },
                 ];
 
@@ -291,17 +290,21 @@ impl OpenVmmInner {
                     ports.push(PcieRootPortConfig {
                         name: format!("{}{}", OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, index),
                         hotplug: true,
+                        acs_capabilities_supported: None,
+                        cxl: false,
                     });
                 }
 
                 // Cold-plug ports for VFIO PCI pass-through (GPUs, NVSwitches,
-                // InfiniBand VFs). Allocated on demand so the root complex
-                // stays within the OPENVMM_MAX_PCIE_ROOT_PORTS budget when no
-                // VFIO devices are assigned.
+                // InfiniBand VFs). Allocated on demand from the pending
+                // device list (see VFIO counting above). With
+                // OPENVMM_HARD_MAX_ROOT_PORTS = 256 there is plenty of room.
                 for index in 0..n_vfio_ports {
                     ports.push(PcieRootPortConfig {
                         name: format!("{}{}", OPENVMM_VFIO_COLDPLUG_PORT_PREFIX, index),
                         hotplug: false,
+                        acs_capabilities_supported: None,
+                        cxl: false,
                     });
                 }
 
@@ -489,7 +492,7 @@ impl OpenVmmInner {
                         let full_bdf =
                             format!("{}:{}", hostdev.domain, hostdev.bus_slot_func);
 
-                        if next_vfio_port >= n_vfio_ports {
+                        if u16::from(next_vfio_port) >= n_vfio_ports {
                             return Err(anyhow!(
                                 "openvmm: VFIO port accounting mismatch (limit {}), \
                                  cannot cold-plug BDF {}",
@@ -573,12 +576,6 @@ impl OpenVmmInner {
             vpci_devices: vec![],
             memory: OvmmMemoryConfig {
                 mem_size: mem_size_bytes,
-                // Keep the default low/high MMIO gaps and additionally declare
-                // our PCIe ECAM and PCIe MMIO ranges so the memory layout
-                // carves RAM around them. See the PCIe layout comment above.
-                mmio_gaps: DEFAULT_MMIO_GAPS_X86.into(),
-                pci_ecam_gaps: vec![ecam_range],
-                pci_mmio_gaps: vec![low_mmio_range, high_mmio_range],
                 prefetch_memory: false,
                 private_memory: false,
                 transparent_hugepages: false,
@@ -616,8 +613,9 @@ impl OpenVmmInner {
             vmbus_devices,
             chipset_devices,
             pci_chipset_devices,
+            isa_dma_controller,
             chipset_capabilities,
-            generation_id_recv: None,
+            layout: layout_config,
             rtc_delta_milliseconds: 0,
             automatic_guest_reset: true,
             efi_diagnostics_log_level: Default::default(),
