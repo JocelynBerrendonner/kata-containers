@@ -59,7 +59,14 @@ impl OpenVmmInner {
         info!(sl!(), "openvmm: prepare_vm id={}", id);
         self.id = id.to_string();
         self.state = VmmState::NotReady;
-        self.pending_devices.clear();
+        // Do NOT clear pending_devices here: cold-plug VFIO devices are
+        // pre-registered by VirtSandbox::prepare_coldplug_raw_vfio_devices()
+        // BEFORE sandbox.start() invokes prepare_vm(). OpenVmmInner is
+        // freshly constructed per sandbox in OpenVmm::new(), so the queue
+        // is already empty on first entry and there is nothing stale to
+        // clear. Wiping it here would drop the pre-registered VFIO
+        // devices and cause start_vm() to size zero cold-plug PCIe
+        // root ports, leaving the guest with no GPUs.
         self.clear_block_hotplug_ports();
         self.vm_path = get_sandbox_path(id);
         self.jailer_root = get_jailer_root(id);
@@ -199,17 +206,63 @@ impl OpenVmmInner {
             .checked_mul(1024 * 1024)
             .context("memory size overflow")?;
 
-        // PCIe root complex: ECAM range must match bus count.
-        // 128MB ECAM = 128 buses (0..127), each bus has 256 devfns * 4KB config = 1MB.
+        // PCIe root complex layout.
+        //
+        // Absolute address ranges (intentionally generous; we may revisit
+        // these with the openvmm team to align with the
+        // `openvmm/openvmm_entry/src/lib.rs` reference pattern, which
+        // anchors the windows below/above `DEFAULT_MMIO_GAPS_X86`. For
+        // now keep the previous values — they are larger than John's
+        // recommendation (>= 512 MB low, >= 4 TB high) and shouldn't
+        // harm in the short run):
+        //
+        //   ecam      = 0xe800_0000..0xf000_0000  (128 MB, 128 buses)
+        //   low_mmio  = 0xc000_0000..0xe800_0000  (640 MB, 32-bit BARs)
+        //   high_mmio = 0x0020_3d30_0000..0x200f_3d30_0000  (~125 TB,
+        //                                                    64-bit
+        //                                                    prefetchable
+        //                                                    BARs)
+        //
+        // These windows sit outside `DEFAULT_MMIO_GAPS_X86` (low gap
+        // 0xf800_0000..0x1_0000_0000, high gap 0xf_e000_0000..0x10_0000_0000)
+        // and are non-overlapping when combined with them.
+        //
+        // CRITICAL: in addition to setting `low_mmio`/`high_mmio` on the
+        // root complex, we MUST also declare them in `pci_ecam_gaps` and
+        // `pci_mmio_gaps` on the MemoryConfig below.
+        // `MemoryLayout::new()` concatenates all three
+        // (mmio_gaps + pci_ecam_gaps + pci_mmio_gaps) when carving RAM
+        // around MMIO. Leaving them empty makes the memory layout treat
+        // our PCIe windows as RAM, which prevents the Linux PCI allocator
+        // from placing BARs and leaves them at GPA 0.
+        let ecam_range =
+            ovmm_memory_range::MemoryRange::new(0xe800_0000..0xf000_0000);
+        let low_mmio_range =
+            ovmm_memory_range::MemoryRange::new(0xc000_0000..0xe800_0000);
+        let high_mmio_range = ovmm_memory_range::MemoryRange::new(
+            0x0020_3d30_0000..0x200f_3d30_0000,
+        );
+
+        info!(
+            sl!(),
+            "openvmm: PCIe layout ecam={:#x}..{:#x} low_mmio={:#x}..{:#x} high_mmio={:#x}..{:#x}",
+            ecam_range.start(),
+            ecam_range.end(),
+            low_mmio_range.start(),
+            low_mmio_range.end(),
+            high_mmio_range.start(),
+            high_mmio_range.end()
+        );
+
         let pcie_root_complexes = vec![PcieRootComplexConfig {
             index: 0,
             name: "rc0".to_string(),
             segment: 0,
             start_bus: 0,
             end_bus: 127,
-            ecam_range: ovmm_memory_range::MemoryRange::new(0xe800_0000..0xf000_0000),
-            low_mmio: ovmm_memory_range::MemoryRange::new(0xc000_0000..0xd400_0000),
-            high_mmio: ovmm_memory_range::MemoryRange::new(0x0020_3d30_0000..0x200f_3d30_0000),
+            ecam_range,
+            low_mmio: low_mmio_range,
+            high_mmio: high_mmio_range,
             ports: {
                 let mut ports = vec![
                     PcieRootPortConfig {
@@ -420,13 +473,28 @@ impl OpenVmmInner {
                             );
                             continue;
                         }
+                        if hostdev.domain.is_empty() {
+                            warn!(
+                                sl!(),
+                                "openvmm: skipping VFIO device with empty PCI domain (BDF {}) in group {}",
+                                hostdev.bus_slot_func,
+                                host_path
+                            );
+                            continue;
+                        }
+                        // OpenVMM expects the full PCI BDF including the segment/
+                        // domain (e.g. "0001:00:00.0") to resolve /sys/bus/pci/
+                        // devices/<full_bdf>. HostDevice splits these into
+                        // `domain` ("0001") and `bus_slot_func` ("00:00.0").
+                        let full_bdf =
+                            format!("{}:{}", hostdev.domain, hostdev.bus_slot_func);
 
                         if next_vfio_port >= n_vfio_ports {
                             return Err(anyhow!(
                                 "openvmm: VFIO port accounting mismatch (limit {}), \
                                  cannot cold-plug BDF {}",
                                 n_vfio_ports,
-                                hostdev.bus_slot_func
+                                full_bdf
                             ));
                         }
 
@@ -437,7 +505,7 @@ impl OpenVmmInner {
                             .with_context(|| {
                                 format!(
                                     "openvmm: failed to open VFIO group {} for BDF {}",
-                                    host_path, hostdev.bus_slot_func
+                                    host_path, full_bdf
                                 )
                             })?;
 
@@ -450,14 +518,14 @@ impl OpenVmmInner {
                         info!(
                             sl!(),
                             "openvmm: assigning VFIO BDF {} to port {}",
-                            hostdev.bus_slot_func,
+                            full_bdf,
                             port_name
                         );
 
                         pcie_devices.push(PcieDeviceConfig {
                             port_name,
                             resource: vfio_assigned_device_resources::VfioDeviceHandle {
-                                pci_id: hostdev.bus_slot_func.clone(),
+                                pci_id: full_bdf,
                                 group: group_fd,
                             }
                             .into_resource(),
@@ -505,9 +573,12 @@ impl OpenVmmInner {
             vpci_devices: vec![],
             memory: OvmmMemoryConfig {
                 mem_size: mem_size_bytes,
+                // Keep the default low/high MMIO gaps and additionally declare
+                // our PCIe ECAM and PCIe MMIO ranges so the memory layout
+                // carves RAM around them. See the PCIe layout comment above.
                 mmio_gaps: DEFAULT_MMIO_GAPS_X86.into(),
-                pci_ecam_gaps: vec![],
-                pci_mmio_gaps: vec![],
+                pci_ecam_gaps: vec![ecam_range],
+                pci_mmio_gaps: vec![low_mmio_range, high_mmio_range],
                 prefetch_memory: false,
                 private_memory: false,
                 transparent_hugepages: false,

@@ -48,7 +48,7 @@ shim-interface = { workspace = true }
 persist = { workspace = true }
 ch-config = { workspace = true, optional = true }
 tests_utils = { workspace = true }
-tracing-subscriber = { version = "0.3", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
 
 # Local dependencies: Dragonball
 dragonball = { workspace = true, features = [

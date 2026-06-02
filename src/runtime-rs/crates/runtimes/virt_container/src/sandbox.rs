@@ -39,6 +39,14 @@ use hypervisor::{
 use hypervisor::{BlockConfig, Hypervisor};
 use hypervisor::{BlockDeviceAio, PortDeviceConfig};
 use hypervisor::{ProtectionDeviceConfig, SevSnpConfig, TdxConfig};
+use hypervisor::{
+    device::{
+        device_manager::do_handle_device,
+        util::{get_host_path, DEVICE_TYPE_CHAR},
+        DeviceConfig,
+    },
+    VfioConfig,
+};
 use kata_sys_util::hooks::HookStates;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_sys_util::spec::load_oci_spec;
@@ -565,6 +573,107 @@ impl VirtSandbox {
     ) -> bool {
         !prestart_hooks.is_empty() || !create_runtime_hooks.is_empty()
     }
+
+    // Pre-walk the container OCI spec for VFIO devices and register them
+    // with the resource manager before the VM is started. Hypervisors that
+    // require VFIO cold-plug (currently openvmm) rely on the devices being
+    // queued before `start_vm` so that the firmware-described PCIe tree
+    // includes them.
+    //
+    // The OCI spec is loaded from `sandbox_config.state.bundle/config.json`
+    // (matching the structure introduced by BbolroC's upstream draft
+    // `vfio-ap-passthrough-coldplug-runtime-rs`, commit `4ee4542759`). In
+    // single-container scenarios (e.g. `nerdctl --device`) the sandbox
+    // bundle path IS the container bundle, so devices appear in
+    // `linux.devices`. In K8s pod scenarios the sandbox bundle is the
+    // pause container's bundle which has no VFIO devices, so this is a
+    // no-op there — the CDI/device-plugin path handles those.
+    //
+    // For hypervisors that natively support post-start VFIO hot-plug
+    // (qemu, dragonball), this duplicates work that would otherwise happen
+    // later from `Container::create`, but `do_handle_device` is idempotent
+    // — the second call finds the device already registered and only
+    // bumps the attach count.
+    //
+    // TODO(rebase): when commit `4f618d09d5` ("CDI cold-plug") lands and
+    // we rebase forward, change this to return
+    // `Vec<ResourceConfig::VfioDeviceModern(VfioDeviceBase{..})>` and
+    // merge into `prepare_coldplug_cdi_devices`'s output. Also gate on
+    // `hypervisor_config.device_info.cold_plug_vfio == "root-port"`.
+    #[instrument(name = "sb: prepare_coldplug_raw_vfio_devices")]
+    async fn prepare_coldplug_raw_vfio_devices(
+        &self,
+        sandbox_config: &SandboxConfig,
+    ) -> Result<()> {
+        let bundle = &sandbox_config.state.bundle;
+        if bundle.is_empty() {
+            return Ok(());
+        }
+
+        let spec_path = format!("{}/config.json", bundle);
+        let oci_spec = match oci::Spec::load(&spec_path) {
+            Ok(s) => s,
+            Err(e) => {
+                info!(
+                    sl!(),
+                    "sb: skip raw VFIO cold-plug, cannot load OCI spec from {}: {}",
+                    spec_path,
+                    e
+                );
+                return Ok(());
+            }
+        };
+
+        let devices = match oci_spec
+            .linux()
+            .as_ref()
+            .and_then(|l| l.devices().as_ref())
+        {
+            Some(devs) if !devs.is_empty() => devs.clone(),
+            _ => return Ok(()),
+        };
+
+        let bus_type = if uses_native_ccw_bus() {
+            "ccw".to_string()
+        } else {
+            "pci".to_string()
+        };
+
+        let device_manager = self.resource_manager.get_device_manager().await;
+
+        for d in devices.iter() {
+            if !matches!(d.typ(), oci::LinuxDeviceType::C) {
+                continue;
+            }
+
+            let host_path = match get_host_path(DEVICE_TYPE_CHAR, d.major(), d.minor()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !host_path.starts_with("/dev/vfio") {
+                continue;
+            }
+
+            info!(
+                sl!(),
+                "sb: pre-registering VFIO cold-plug device {}", host_path
+            );
+
+            let dev_info = DeviceConfig::VfioCfg(VfioConfig {
+                host_path,
+                dev_type: "c".to_string(),
+                bus_type: bus_type.clone(),
+                hostdev_prefix: "vfio_device".to_owned(),
+                ..Default::default()
+            });
+
+            do_handle_device(&device_manager, &dev_info)
+                .await
+                .context("pre-register VFIO device before VM start")?;
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -601,6 +710,23 @@ impl Sandbox for VirtSandbox {
             )
             .await
             .context("prepare vm")?;
+
+        // Pre-walk the container OCI spec and cold-plug raw VFIO devices
+        // before the VM starts so that hypervisors which require it
+        // (currently openvmm) can wire them into the firmware-described
+        // PCIe tree. This mirrors the upstream design from
+        // BbolroC:vfio-ap-passthrough-coldplug-runtime-rs (commit
+        // 4ee4542759) so the merge surface is minimal once the CDI
+        // cold-plug infrastructure (commit 4f618d09d5) lands and we
+        // rebase forward.
+        //
+        // TODO(rebase): when `4f618d09d5` lands, change this to return
+        // `Vec<ResourceConfig>` of `ResourceConfig::VfioDeviceModern` and
+        // merge with `prepare_coldplug_cdi_devices`. Also gate on
+        // `hypervisor_config.device_info.cold_plug_vfio == "root-port"`.
+        self.prepare_coldplug_raw_vfio_devices(sandbox_config)
+            .await
+            .context("prepare raw VFIO cold-plug devices")?;
 
         // generate device and setup before start vm
         // should after hypervisor.prepare_vm
