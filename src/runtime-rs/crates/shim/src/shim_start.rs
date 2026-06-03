@@ -102,22 +102,17 @@ impl ShimExecutor {
             ENV_KATA_RUNTIME_BIND_FD,
             format!("{}", socket.into_raw_fd()),
         );
-        // === DEBUG (temporary): log fork of the long-running shim worker.
-        // The `start` invocation forks the `run` worker; we want to know
-        // the new pid so we can correlate kernel/journal/strace data.
-        eprintln!(
-            "kata-shim-debug: create_shim_process id={} about to spawn",
-            self.args.id
-        );
+        // NOTE: do NOT eprintln! here. Containerd's runtime-v2 binary client
+        // captures the Start subcommand via cmd.CombinedOutput() and parses
+        // the result as the TTRPC address. Any byte on stdout or stderr
+        // (merged into the same buffer) other than the address line breaks
+        // TTRPC negotiation with "unsupported protocol". The on-disk record
+        // below (/var/log/kata-shim/invocations.log) is sufficient.
         let child = cmd
             .spawn()
             .map_err(Error::SpawnChild)
             .context("spawn child")?;
         let pid = child.id();
-        eprintln!(
-            "kata-shim-debug: create_shim_process id={} spawned pid={}",
-            self.args.id, pid
-        );
         // Also persist to disk so we can find the pid even if containerd
         // dropped its stderr buffer.
         if let Ok(mut f) = std::fs::OpenOptions::new()

@@ -185,9 +185,12 @@ fn debug_log_invocation(stage: &str, extra: &str) {
         );
         let _ = f.flush();
     }
-    // Also dump to stderr (captured by containerd) so we get a second
-    // copy in the containerd journal even if /var/log is full.
-    eprintln!("kata-shim-debug: stage={} {}", stage, extra);
+    // NOTE: do NOT mirror this to stderr. Containerd's runtime-v2 binary
+    // client captures the Start subcommand via cmd.CombinedOutput() and
+    // parses the result as the TTRPC address. Any byte on stdout or stderr
+    // (which are merged into the same buffer) other than the address line
+    // breaks TTRPC negotiation with "unsupported protocol". On-disk logs
+    // are enough for post-mortem analysis.
 }
 
 fn real_main() -> Result<()> {
