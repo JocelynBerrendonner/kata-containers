@@ -606,7 +606,12 @@ impl VirtSandbox {
         sandbox_config: &SandboxConfig,
     ) -> Result<()> {
         let bundle = &sandbox_config.state.bundle;
+        info!(
+            sl!(),
+            "sb:coldplug begin sid={} bundle={}", self.sid, bundle
+        );
         if bundle.is_empty() {
+            info!(sl!(), "sb:coldplug skip (empty bundle)");
             return Ok(());
         }
 
@@ -630,8 +635,16 @@ impl VirtSandbox {
             .and_then(|l| l.devices().as_ref())
         {
             Some(devs) if !devs.is_empty() => devs.clone(),
-            _ => return Ok(()),
+            _ => {
+                info!(sl!(), "sb:coldplug no linux.devices in OCI spec");
+                return Ok(());
+            }
         };
+        info!(
+            sl!(),
+            "sb:coldplug scanning {} linux.devices",
+            devices.len()
+        );
 
         let bus_type = if uses_native_ccw_bus() {
             "ccw".to_string()
@@ -641,6 +654,7 @@ impl VirtSandbox {
 
         let device_manager = self.resource_manager.get_device_manager().await;
 
+        let mut registered = 0usize;
         for d in devices.iter() {
             if !matches!(d.typ(), oci::LinuxDeviceType::C) {
                 continue;
@@ -656,11 +670,14 @@ impl VirtSandbox {
 
             info!(
                 sl!(),
-                "sb: pre-registering VFIO cold-plug device {}", host_path
+                "sb: pre-registering VFIO cold-plug device {} (major={} minor={})",
+                host_path,
+                d.major(),
+                d.minor()
             );
 
             let dev_info = DeviceConfig::VfioCfg(VfioConfig {
-                host_path,
+                host_path: host_path.clone(),
                 dev_type: "c".to_string(),
                 bus_type: bus_type.clone(),
                 hostdev_prefix: "vfio_device".to_owned(),
@@ -670,8 +687,19 @@ impl VirtSandbox {
             do_handle_device(&device_manager, &dev_info)
                 .await
                 .context("pre-register VFIO device before VM start")?;
+            registered += 1;
+            info!(
+                sl!(),
+                "sb:coldplug pre-registered device {} (running total {})",
+                host_path,
+                registered
+            );
         }
 
+        info!(
+            sl!(),
+            "sb:coldplug done sid={} registered={}", self.sid, registered
+        );
         Ok(())
     }
 }
@@ -681,6 +709,32 @@ impl Sandbox for VirtSandbox {
     #[instrument(name = "sb: start")]
     async fn start(&self) -> Result<()> {
         let id = &self.sid;
+        // === DEBUG (temporary): per-phase timing for the sandbox start path.
+        // We want answers like "did we hang in start_vm or in agent.start?"
+        // without needing to attach strace. Remove before merging.
+        let phase_t0 = std::time::Instant::now();
+        macro_rules! sb_phase {
+            ($name:literal) => {
+                info!(
+                    sl!(),
+                    "sb:start phase={} sid={} elapsed_ms={}",
+                    $name,
+                    id,
+                    phase_t0.elapsed().as_millis()
+                );
+            };
+            ($name:literal, $extra:expr) => {
+                info!(
+                    sl!(),
+                    "sb:start phase={} sid={} elapsed_ms={} {}",
+                    $name,
+                    id,
+                    phase_t0.elapsed().as_millis(),
+                    $extra
+                );
+            };
+        }
+        sb_phase!("begin");
 
         if self.sandbox_config.is_none() {
             return Err(anyhow!("sandbox config is missing"));
@@ -701,6 +755,7 @@ impl Sandbox for VirtSandbox {
                 .and_then(|process| process.selinux_label().clone())
         });
 
+        sb_phase!("calling_prepare_vm");
         self.hypervisor
             .prepare_vm(
                 id,
@@ -710,6 +765,7 @@ impl Sandbox for VirtSandbox {
             )
             .await
             .context("prepare vm")?;
+        sb_phase!("prepare_vm_done");
 
         // Pre-walk the container OCI spec and cold-plug raw VFIO devices
         // before the VM starts so that hypervisors which require it
@@ -724,23 +780,34 @@ impl Sandbox for VirtSandbox {
         // `Vec<ResourceConfig>` of `ResourceConfig::VfioDeviceModern` and
         // merge with `prepare_coldplug_cdi_devices`. Also gate on
         // `hypervisor_config.device_info.cold_plug_vfio == "root-port"`.
+        sb_phase!("calling_coldplug_vfio");
         self.prepare_coldplug_raw_vfio_devices(sandbox_config)
             .await
             .context("prepare raw VFIO cold-plug devices")?;
+        sb_phase!("coldplug_vfio_done");
 
         // generate device and setup before start vm
         // should after hypervisor.prepare_vm
+        sb_phase!("calling_prepare_for_start_sandbox");
         let resources = self
             .prepare_for_start_sandbox(id, sandbox_config.network_env.clone())
             .await?;
+        sb_phase!(
+            "prepare_for_start_sandbox_done",
+            format!("resource_count={}", resources.len())
+        );
 
+        sb_phase!("calling_prepare_before_start_vm");
         self.resource_manager
             .prepare_before_start_vm(resources)
             .await
             .context("set up device before start vm")?;
+        sb_phase!("prepare_before_start_vm_done");
 
         // start vm
+        sb_phase!("calling_start_vm");
         self.hypervisor.start_vm(10_000).await.context("start vm")?;
+        sb_phase!("start_vm_done");
         info!(sl!(), "start vm");
 
         // execute pre-start hook functions, including Prestart Hooks and CreateRuntime Hooks
@@ -754,12 +821,14 @@ impl Sandbox for VirtSandbox {
                 (Vec::new(), Vec::new())
             };
 
+        sb_phase!("calling_oci_hooks");
         self.execute_oci_hook_functions(
             &prestart_hooks,
             &create_runtime_hooks,
             &sandbox_config.state,
         )
         .await?;
+        sb_phase!("oci_hooks_done");
 
         // 1. if there are pre-start hook functions, network config might have been changed.
         //    We need to rescan the netns to handle the change.
@@ -782,30 +851,40 @@ impl Sandbox for VirtSandbox {
                         .network_queues as usize,
                     network_created: sandbox_config.network_env.network_created,
                 });
+                sb_phase!("calling_handle_network");
                 self.resource_manager
                     .handle_network(network_resource)
                     .await
                     .context("set up device after start vm")?;
+                sb_phase!("handle_network_done");
             }
         }
 
         // connect agent
         // set agent socket
+        sb_phase!("calling_get_agent_socket");
         let address = self
             .hypervisor
             .get_agent_socket()
             .await
             .context("get agent socket")?;
+        sb_phase!("get_agent_socket_done", format!("addr={:?}", address));
+        sb_phase!("calling_agent_start");
         self.agent
             .start(&address)
             .await
             .context(format!("connect to address {:?}", &address))?;
+        sb_phase!("agent_start_done");
+        sb_phase!("calling_set_agent_policy");
         self.set_agent_policy().await.context("set agent policy")?;
+        sb_phase!("set_agent_policy_done");
 
+        sb_phase!("calling_setup_after_start_vm");
         self.resource_manager
             .setup_after_start_vm()
             .await
             .context("setup device after start vm")?;
+        sb_phase!("setup_after_start_vm_done");
 
         // create sandbox in vm
         let agent_config = self.agent.agent_config().await;
@@ -833,6 +912,12 @@ impl Sandbox for VirtSandbox {
             .create_sandbox(req)
             .await
             .context("create sandbox")?;
+        info!(
+            sl!(),
+            "sb:start phase=create_sandbox_done sid={} elapsed_ms={}",
+            id,
+            phase_t0.elapsed().as_millis()
+        );
 
         inner.state = SandboxState::Running;
 
@@ -840,6 +925,12 @@ impl Sandbox for VirtSandbox {
         self.store_guest_details()
             .await
             .context("failed to store guest details")?;
+        info!(
+            sl!(),
+            "sb:start phase=store_guest_details_done sid={} elapsed_ms={}",
+            id,
+            phase_t0.elapsed().as_millis()
+        );
 
         let agent = self.agent.clone();
         let sender = self.msg_sender.clone();

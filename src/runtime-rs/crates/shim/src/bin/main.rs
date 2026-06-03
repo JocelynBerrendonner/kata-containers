@@ -159,8 +159,48 @@ fn get_tokio_runtime() -> Result<tokio::runtime::Runtime> {
     Ok(rt)
 }
 
+// === DEBUG (temporary): persistent invocation trace ===
+// Writes one line per shim invocation BEFORE anything else runs, so we
+// can verify that containerd actually spawned us, see the argv it used,
+// and capture any early panic. This survives panics, missing journals,
+// and missing /run dirs. Remove before merging.
+fn debug_log_invocation(stage: &str, extra: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all("/var/log/kata-shim");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/var/log/kata-shim/invocations.log")
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let pid = std::process::id();
+        // SAFETY: getppid is always safe.
+        let ppid = unsafe { libc::getppid() };
+        let _ = writeln!(
+            f,
+            "[{:.3}] pid={} ppid={} stage={} {}",
+            ts, pid, ppid, stage, extra
+        );
+        let _ = f.flush();
+    }
+    // Also dump to stderr (captured by containerd) so we get a second
+    // copy in the containerd journal even if /var/log is full.
+    eprintln!("kata-shim-debug: stage={} {}", stage, extra);
+}
+
 fn real_main() -> Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
+    debug_log_invocation(
+        "main",
+        &format!(
+            "argv={:?} cwd={:?}",
+            args,
+            std::env::current_dir().ok()
+        ),
+    );
     if args.is_empty() {
         return Err(anyhow!(Error::ArgumentIsEmpty(
             "command-line arguments".to_string()
@@ -168,21 +208,49 @@ fn real_main() -> Result<()> {
     }
 
     let action = parse_args(&args).context("parse args")?;
+    let action_name = match &action {
+        Action::Run(_) => "Run",
+        Action::Start(_) => "Start",
+        Action::Delete(_) => "Delete",
+        Action::Help => "Help",
+        Action::Version => "Version",
+        Action::Info => "Info",
+    };
+    debug_log_invocation("action", &format!("selected={}", action_name));
     match action {
-        Action::Start(args) => ShimExecutor::new(args).start().context("shim start")?,
+        Action::Start(args) => {
+            debug_log_invocation("start:begin", &format!("id={}", args.id));
+            let res = ShimExecutor::new(args).start().context("shim start");
+            debug_log_invocation(
+                "start:end",
+                &format!("ok={}", res.is_ok()),
+            );
+            res?;
+        }
         Action::Delete(args) => {
+            debug_log_invocation("delete:begin", &format!("id={}", args.id));
             let mut shim = ShimExecutor::new(args);
             let rt = get_tokio_runtime().context("get tokio runtime")?;
-            rt.block_on(shim.delete())?;
+            let res = rt.block_on(shim.delete());
+            debug_log_invocation(
+                "delete:end",
+                &format!("ok={}", res.is_ok()),
+            );
+            res?;
         }
         Action::Run(args) => {
             // set mnt namespace
             // need setup before other async call
+            debug_log_invocation("run:begin", &format!("id={}", args.id));
             setup_mnt().context("setup mnt")?;
+            debug_log_invocation("run:mnt_ready", "");
 
             let mut shim = ShimExecutor::new(args);
             let rt = get_tokio_runtime().context("get tokio runtime")?;
-            rt.block_on(shim.run())?;
+            debug_log_invocation("run:tokio_ready", "");
+            let res = rt.block_on(shim.run());
+            debug_log_invocation("run:end", &format!("ok={}", res.is_ok()));
+            res?;
         }
         Action::Help => show_help(&args[0]),
         Action::Version => show_version(None),

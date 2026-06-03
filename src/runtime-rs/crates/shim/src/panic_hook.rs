@@ -38,6 +38,35 @@ pub(crate) fn set_panic_hook() {
             "A panic occurred at {}:{}: {}\r\n{:?}", filename, line, cause, bt_data
         );
 
+        // === DEBUG (temporary): also persist panics to a stable file on
+        // disk so that we capture them even when slog isn't usable
+        // (early-init failures) or when journald is misconfigured.
+        let _ = std::fs::create_dir_all("/var/log/kata-shim");
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/var/log/kata-shim/panics.log")
+        {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let pid = std::process::id();
+            let tid = std::thread::current().id();
+            let tname = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_string();
+            let _ = writeln!(
+                f,
+                "[{:.3}] pid={} tid={:?} tname={} panic at {}:{}: {}",
+                ts, pid, tid, tname, filename, line, cause
+            );
+            let _ = writeln!(f, "{bt_data}");
+            let _ = writeln!(f, "----");
+            let _ = f.flush();
+        }
+
         // print panic log to dmesg
         // The panic log size is too large to /dev/kmsg, so write by line.
         if let Ok(mut file) = OpenOptions::new().write(true).open(KMESG_DEVICE) {

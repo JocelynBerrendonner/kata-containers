@@ -56,7 +56,13 @@ fn build_kernel_cmdline(
 
 impl OpenVmmInner {
     pub(crate) async fn prepare_vm(&mut self, id: &str, netns: Option<String>) -> Result<()> {
-        info!(sl!(), "openvmm: prepare_vm id={}", id);
+        info!(
+            sl!(),
+            "openvmm: prepare_vm id={} netns={:?} pending_devices_before={}",
+            id,
+            netns,
+            self.pending_devices.len()
+        );
         self.id = id.to_string();
         self.state = VmmState::NotReady;
         // Do NOT clear pending_devices here: cold-plug VFIO devices are
@@ -78,11 +84,43 @@ impl OpenVmmInner {
         fs::create_dir_all(&self.run_dir)
             .with_context(|| format!("failed to create run dir: {}", self.run_dir))?;
 
+        info!(
+            sl!(),
+            "openvmm: prepare_vm done id={} jailer_root={} run_dir={}",
+            self.id,
+            self.jailer_root,
+            self.run_dir
+        );
         Ok(())
     }
 
     pub(crate) async fn start_vm(&mut self, _timeout: i32) -> Result<()> {
-        info!(sl!(), "openvmm: start_vm");
+        let start_vm_t0 = std::time::Instant::now();
+        info!(
+            sl!(),
+            "openvmm: start_vm begin pending_devices={} state={:?}",
+            self.pending_devices.len(),
+            self.state
+        );
+        macro_rules! sv_phase {
+            ($name:literal) => {
+                info!(
+                    sl!(),
+                    "openvmm:start_vm phase={} elapsed_ms={}",
+                    $name,
+                    start_vm_t0.elapsed().as_millis()
+                );
+            };
+            ($name:literal, $extra:expr) => {
+                info!(
+                    sl!(),
+                    "openvmm:start_vm phase={} elapsed_ms={} {}",
+                    $name,
+                    start_vm_t0.elapsed().as_millis(),
+                    $extra
+                );
+            };
+        }
 
         // Count VFIO devices up front so we can size the cold-plug portion
         // of the PCIe root complex. The block-hotplug pool is fixed-size
@@ -131,6 +169,7 @@ impl OpenVmmInner {
             n_vfio_ports,
             total_ports
         );
+        sv_phase!("port_count_done", format!("static={} hotplug={} vfio={} total={}", OPENVMM_STATIC_PCI_PORT_COUNT, n_hotplug_ports, n_vfio_ports, total_ports));
         // (Re)populate the block-hotplug free pool.
         self.populate_block_hotplug_ports(n_hotplug_ports);
 
@@ -140,6 +179,7 @@ impl OpenVmmInner {
             &self.config.boot_info.kernel_verity_params,
             &self.config.boot_info.rootfs_type,
         )?;
+        sv_phase!("cmdline_built", format!("len={}", cmdline.len()));
 
         info!(sl!(), "openvmm: kernel={}", self.config.boot_info.kernel);
         info!(sl!(), "openvmm: image={}", self.config.boot_info.image);
@@ -148,6 +188,7 @@ impl OpenVmmInner {
         // Open kernel file
         let kernel = File::open(&self.config.boot_info.kernel)
             .with_context(|| format!("failed to open kernel: {}", self.config.boot_info.kernel))?;
+        sv_phase!("kernel_opened");
 
         let load_mode = LoadMode::Linux {
             kernel,
@@ -209,6 +250,7 @@ impl OpenVmmInner {
         } = chipset_builder
             .build()
             .context("failed to build VM chipset manifest")?;
+        sv_phase!("chipset_built");
 
         // Memory config
         let mem_size_bytes = (self.config.memory_info.default_memory as u64)
@@ -331,6 +373,7 @@ impl OpenVmmInner {
 
         // Process pending devices into the VM config
         let pending = std::mem::take(&mut self.pending_devices);
+        sv_phase!("draining_pending_devices", format!("count={}", pending.len()));
         let vmbus_devices: Vec<(DeviceVtl, vm_resource::Resource<VmbusDeviceHandleKind>)> =
             Vec::new();
         let mut deferred_block_devices = Vec::new();
@@ -547,6 +590,7 @@ impl OpenVmmInner {
         let vsock_uds_path = format!("{}/vsock.sock", self.run_dir);
         info!(sl!(), "openvmm: virtio-vsock uds path: {}", vsock_uds_path);
         let _ = std::fs::remove_file(&vsock_uds_path);
+        sv_phase!("vsock_path_prepared", format!("path={}", vsock_uds_path));
 
         // Add virtio-console PCIe device for guest console output.
         pcie_devices.push(PcieDeviceConfig {
@@ -623,6 +667,7 @@ impl OpenVmmInner {
 
         // Launch the VM worker
         info!(sl!(), "openvmm: launching VM worker");
+        sv_phase!("calling_launch_worker");
         self.vmm_instance
             .launch(
                 vm_config,
@@ -634,22 +679,27 @@ impl OpenVmmInner {
             )
             .await
             .context("failed to launch VM worker")?;
+        sv_phase!("launch_worker_returned");
 
         // Resume (boot) the VM
         info!(sl!(), "openvmm: resuming VM");
+        sv_phase!("calling_resume");
         self.vmm_instance
             .resume()
             .await
             .context("failed to resume VM")?;
+        sv_phase!("resume_returned");
 
         self.state = VmmState::VmRunning;
         info!(sl!(), "openvmm: VM is running");
+        sv_phase!("vm_running");
 
         for device in deferred_block_devices {
             self.add_device(device)
                 .await
                 .context("failed to hotplug deferred block device")?;
         }
+        sv_phase!("deferred_blocks_done");
 
         Ok(())
     }

@@ -82,9 +82,49 @@ impl VmmInstance {
         // Run everything in a single pal_async thread: bind listener, create
         // worker host, launch worker. This ensures the UnixListener FD stays
         // in the same async runtime as the VmWorker.
+        // === DEBUG (temporary): clone log_dir for the file-backed
+        // breadcrumb writer so we can find where in the worker thread
+        // we got stuck even when nothing reaches the tracing subscriber.
+        let dbg_log_dir = log_dir.clone();
         std::thread::Builder::new()
             .name("ovmm-worker-host".to_string())
             .spawn(move || {
+                // === DEBUG (temporary): per-step breadcrumb writer. Writes
+                // to {log_dir}/launch-progress.log if available, otherwise
+                // to /var/log/kata-shim/openvmm-launch.log. Uses only std
+                // so it can never get blocked by a slog/tracing subscriber.
+                let dbg = |stage: &str, extra: &str| {
+                    use std::io::Write;
+                    let path = match &dbg_log_dir {
+                        Some(d) => format!("{}/launch-progress.log", d),
+                        None => {
+                            let _ = std::fs::create_dir_all("/var/log/kata-shim");
+                            "/var/log/kata-shim/openvmm-launch.log".to_string()
+                        }
+                    };
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64())
+                            .unwrap_or(0.0);
+                        let _ = writeln!(
+                            f,
+                            "[{:.3}] tid={:?} stage={} {}",
+                            ts,
+                            std::thread::current().id(),
+                            stage,
+                            extra
+                        );
+                        let _ = f.flush();
+                    }
+                    eprintln!("openvmm-launch: stage={} {}", stage, extra);
+                };
+                dbg("thread_entered", "");
+
                 // Set up tracing for the VmWorker thread.
                 // Write openvmm tracing output to a log file for debugging.
                 //
@@ -114,18 +154,22 @@ impl VmmInstance {
                             .try_init();
                     }
                 }
+                dbg("tracing_init_done", "");
 
                 if let Some(ref netns_path) = netns {
                     if let Err(err) = enter_netns(netns_path) {
+                        dbg("enter_netns_failed", &format!("path={} err={:?}", netns_path, err));
                         let _ = result_tx.send(Err(
                             err.context(format!("failed to enter netns {}", netns_path))
                         ));
                         return;
                     }
+                    dbg("enter_netns_done", &format!("path={}", netns_path));
                 }
 
                 let add_network_devices = || -> Result<()> {
                     for network_device in network_devices {
+                        dbg("opening_tap", &format!("tap={}", network_device.tap_name));
                         let fd = open_named_tuntap(&network_device.tap_name, 1)
                             .with_context(|| {
                                 format!(
@@ -142,6 +186,7 @@ impl VmmInstance {
                                 )
                             })?
                             .into();
+                        dbg("tap_opened", &format!("tap={}", network_device.tap_name));
 
                         let endpoint = net_backend_resources::tap::TapHandle { fd }.into_resource();
                         let net_handle = virtio_resources::net::VirtioNetHandle {
@@ -167,16 +212,20 @@ impl VmmInstance {
                 };
 
                 if let Err(err) = add_network_devices() {
+                    dbg("network_setup_failed", &format!("err={:?}", err));
                     let _ = result_tx.send(Err(err.context("failed to configure network devices")));
                     return;
                 }
+                dbg("network_setup_done", "");
 
                 // Bind virtio-vsock listener inside this thread and add
                 // the device as a PCIe virtio device.
                 {
                     let _ = std::fs::remove_file(&vsock_uds_path);
+                    dbg("binding_vsock", &format!("path={}", vsock_uds_path));
                     match ovmm_unix_socket::UnixListener::bind(&vsock_uds_path) {
                         Ok(listener) => {
+                            dbg("vsock_bound", &format!("path={}", vsock_uds_path));
                             let has_vsock_port =
                                 config.pcie_root_complexes.iter().any(|root_complex| {
                                     root_complex
@@ -209,6 +258,7 @@ impl VmmInstance {
                                 });
                         }
                         Err(e) => {
+                            dbg("vsock_bind_failed", &format!("path={} err={}", vsock_uds_path, e));
                             let _ = result_tx.send(Err(anyhow::anyhow!(
                                 "failed to bind vsock listener at {}: {}",
                                 vsock_uds_path,
@@ -223,8 +273,10 @@ impl VmmInstance {
                 // mesh channel serialization. Replace the first PCIe device's
                 // virtio-blk resource with one backed by the freshly-opened file.
                 if let Some(ref path) = disk_path {
+                    dbg("opening_disk", &format!("path={}", path));
                     match std::fs::OpenOptions::new().read(true).open(path) {
                         Ok(file) => {
+                            dbg("disk_opened", &format!("path={}", path));
                             let disk_resource =
                                 disk_backend_resources::FileDiskHandle(file).into_resource();
                             let blk_handle = virtio_resources::blk::VirtioBlkHandle {
@@ -242,6 +294,7 @@ impl VmmInstance {
                                 });
                         }
                         Err(e) => {
+                            dbg("disk_open_failed", &format!("path={} err={}", path, e));
                             let _ = result_tx.send(Err(anyhow::anyhow!(
                                 "failed to open disk at {}: {}",
                                 path,
@@ -252,18 +305,25 @@ impl VmmInstance {
                     }
                 }
 
+                dbg("entering_pal_async_default_pool", "");
                 ovmm_pal_async::DefaultPool::run_with(
                     |driver: ovmm_pal_async::DefaultDriver| async move {
                         use ovmm_pal_async::task::Spawn;
 
+                        dbg("pal_async_running", "");
                         let (host, runner) = ovmm_mesh_worker::worker_host();
                         driver
                             .spawn("worker-host-runner", runner.run(RegisteredWorkers))
                             .detach();
+                        dbg("worker_host_spawned", "");
 
                         let hypervisor = match std::fs::File::open("/dev/mshv") {
-                            Ok(mshv) => hypervisor_resources::MshvHandle { mshv }.into_resource(),
+                            Ok(mshv) => {
+                                dbg("mshv_opened", "");
+                                hypervisor_resources::MshvHandle { mshv }.into_resource()
+                            }
                             Err(err) => {
+                                dbg("mshv_open_failed", &format!("err={}", err));
                                 let _ = result_tx.send(Err(anyhow::anyhow!(
                                     "failed to open /dev/mshv for openvmm: {}",
                                     err
@@ -272,6 +332,7 @@ impl VmmInstance {
                             }
                         };
 
+                        dbg("calling_launch_worker", "");
                         let result = host
                             .launch_worker(
                                 VM_WORKER,
@@ -285,13 +346,19 @@ impl VmmInstance {
                                 },
                             )
                             .await;
+                        dbg(
+                            "launch_worker_returned",
+                            &format!("ok={}", result.is_ok()),
+                        );
 
                         let _ = result_tx.send(result.context("failed to launch VM worker"));
+                        dbg("result_tx_sent", "");
 
                         // Keep the pool alive for the VM's lifetime.
                         std::future::pending::<()>().await;
                     },
                 );
+                dbg("pal_async_run_with_returned", "");
             })
             .context("failed to spawn worker host thread")?;
 

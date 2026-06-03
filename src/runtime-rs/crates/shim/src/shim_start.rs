@@ -102,12 +102,39 @@ impl ShimExecutor {
             ENV_KATA_RUNTIME_BIND_FD,
             format!("{}", socket.into_raw_fd()),
         );
+        // === DEBUG (temporary): log fork of the long-running shim worker.
+        // The `start` invocation forks the `run` worker; we want to know
+        // the new pid so we can correlate kernel/journal/strace data.
+        eprintln!(
+            "kata-shim-debug: create_shim_process id={} about to spawn",
+            self.args.id
+        );
         let child = cmd
             .spawn()
             .map_err(Error::SpawnChild)
             .context("spawn child")?;
-
-        Ok(child.id())
+        let pid = child.id();
+        eprintln!(
+            "kata-shim-debug: create_shim_process id={} spawned pid={}",
+            self.args.id, pid
+        );
+        // Also persist to disk so we can find the pid even if containerd
+        // dropped its stderr buffer.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/var/log/kata-shim/invocations.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "[fork] parent_pid={} child_pid={} id={}",
+                std::process::id(),
+                pid,
+                self.args.id
+            );
+        }
+        Ok(pid)
     }
 }
 

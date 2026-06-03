@@ -16,6 +16,36 @@ use crate::{VmmState, KATA_BLK_DEV_TYPE};
 
 impl OpenVmmInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
+        // === DEBUG (temporary): log every add_device call with VMM state
+        // and pending queue depth so we can correlate cold-plug vs.
+        // hotplug behaviour with how many devices are queued.
+        let kind = match &device {
+            DeviceType::Block(_) => "Block",
+            DeviceType::Vfio(_) => "Vfio",
+            DeviceType::Network(_) => "Network",
+            DeviceType::ShareFs(_) => "ShareFs",
+            DeviceType::HybridVsock(_) => "HybridVsock",
+            DeviceType::Vsock(_) => "Vsock",
+            _ => "Other",
+        };
+        info!(
+            sl!(),
+            "openvmm:add_device kind={} state={:?} pending_before={}",
+            kind,
+            self.state,
+            self.pending_devices.len()
+        );
+        if let DeviceType::Vfio(v) = &device {
+            for h in &v.devices {
+                info!(
+                    sl!(),
+                    "openvmm:add_device VFIO host_path={} domain={} bsf={}",
+                    v.config.host_path,
+                    h.domain,
+                    h.bus_slot_func
+                );
+            }
+        }
         if self.state == VmmState::NotReady {
             info!(sl!(), "openvmm: VMM not ready, queueing device {}", device);
             self.pending_devices.push(device.clone());

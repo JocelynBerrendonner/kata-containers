@@ -162,15 +162,32 @@ impl RuntimeHandlerManagerInner {
         spec: Option<&oci::Spec>,
         options: &Option<Vec<u8>>,
     ) -> Result<()> {
+        let phase_t0 = std::time::Instant::now();
+        let phase = |name: &str, extra: &str| {
+            info!(
+                sl!(),
+                "manager:try_init phase={} elapsed_ms={} {}",
+                name,
+                phase_t0.elapsed().as_millis(),
+                extra
+            );
+        };
+        phase("begin", "");
+
         #[cfg(feature = "linux")]
         LinuxContainer::init().context("init linux container")?;
         #[cfg(feature = "wasm")]
         WasmContainer::init().context("init wasm container")?;
         #[cfg(feature = "virt")]
         VirtContainer::init().context("init virt container")?;
+        phase("container_init_done", "");
 
         let mut config =
             load_config(&sandbox_config.annotations, options).context("load config")?;
+        phase(
+            "config_loaded",
+            &format!("hypervisor_name={}", &config.runtime.hypervisor_name),
+        );
 
         let hypervisor_name = &config.runtime.hypervisor_name;
         let hypervisor = config
@@ -197,6 +214,7 @@ impl RuntimeHandlerManagerInner {
                 sandbox_config.network_env.netns = path;
             }
         }
+        phase("rootless_setup_done", "");
 
         // Sandbox sizing information *may* be provided in two scenarios:
         //   1. The upper layer runtime (ie, containerd or crio) provide sandbox sizing information as an annotation
@@ -217,6 +235,7 @@ impl RuntimeHandlerManagerInner {
         initial_size_manager
             .setup_config(&mut config)
             .context("failed to setup static resource mgmt config")?;
+        phase("initial_size_setup_done", "");
 
         update_component_log_level(&config);
 
@@ -226,9 +245,11 @@ impl RuntimeHandlerManagerInner {
             sandbox_config.network_env.netns = None;
         }
 
+        phase("calling_init_runtime_handler", "");
         self.init_runtime_handler(sandbox_config, Arc::new(config), initial_size_manager)
             .await
             .context("init runtime handler")?;
+        phase("runtime_handler_ready", "");
 
         // the sandbox creation can reach here only once and the sandbox is created
         // so we can safely create the shim management socket right now
@@ -241,6 +262,7 @@ impl RuntimeHandlerManagerInner {
 
         tokio::task::spawn(Arc::new(shim_mgmt_svr).run());
         info!(sl!(), "shim management http server starts");
+        phase("done", "");
 
         Ok(())
     }
