@@ -177,8 +177,7 @@ fn debug_log_invocation(stage: &str, extra: &str) {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
         let pid = std::process::id();
-        // SAFETY: getppid is always safe.
-        let ppid = unsafe { libc::getppid() };
+        let ppid = nix::unistd::getppid().as_raw();
         let _ = writeln!(
             f,
             "[{:.3}] pid={} ppid={} stage={} {}",
