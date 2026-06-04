@@ -629,22 +629,21 @@ impl VirtSandbox {
             }
         };
 
-        let devices = match oci_spec
+        let devices = oci_spec
             .linux()
             .as_ref()
             .and_then(|l| l.devices().as_ref())
-        {
-            Some(devs) if !devs.is_empty() => devs.clone(),
-            _ => {
-                info!(sl!(), "sb:coldplug no linux.devices in OCI spec");
-                return Ok(());
-            }
-        };
-        info!(
-            sl!(),
-            "sb:coldplug scanning {} linux.devices",
-            devices.len()
-        );
+            .cloned()
+            .unwrap_or_default();
+        if devices.is_empty() {
+            info!(sl!(), "sb:coldplug no linux.devices in OCI spec");
+        } else {
+            info!(
+                sl!(),
+                "sb:coldplug scanning {} linux.devices",
+                devices.len()
+            );
+        }
 
         let bus_type = if uses_native_ccw_bus() {
             "ccw".to_string()
@@ -695,6 +694,63 @@ impl VirtSandbox {
                 registered
             );
         }
+
+        // BEGIN tactical-coldplug-shim (remove when upstream commit
+        // `4f618d09d5` "CDI cold-plug" is rebased into this branch — see
+        // scripts/TACTICAL-COLDPLUG-REVERT.md for the full undo procedure).
+        //
+        // K8s workaround: in pod scenarios the sandbox bundle is the pause
+        // container's bundle, which has no VFIO `linux.devices`, and the
+        // workload container's spec is delivered AFTER `start_vm` via
+        // device-plugin Allocate(). OpenVMM cannot hot-plug VFIO, so the
+        // VM is built without any GPU and the NVIDIA init in the guest
+        // panics on `modprobe nvidia`.
+        //
+        // As a stop-gap, pod authors can list host VFIO group paths under
+        // the pod annotation `io.katacontainers.devices.cold_plug_vfio`
+        // (CSV of `/dev/vfio/<group>`). The shim turns each into a
+        // VfioConfig and feeds it through the same `do_handle_device`
+        // path the OCI scanner uses, so they get cold-plugged before
+        // `start_vm`. Script `09-create-a-GPU-enabled-Kata-POD.sh`
+        // populates this annotation from the BDFs it detects on vfio-pci.
+        const TACTICAL_COLDPLUG_ANNOTATION: &str = "io.katacontainers.devices.cold_plug_vfio";
+        if let Some(csv) = sandbox_config.annotations.get(TACTICAL_COLDPLUG_ANNOTATION) {
+            info!(
+                sl!(),
+                "sb:coldplug tactical annotation present, value={:?}", csv
+            );
+            for path in csv.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if !path.starts_with("/dev/vfio/") {
+                    warn!(
+                        sl!(),
+                        "sb:coldplug skipping non-vfio annotation entry '{}'", path
+                    );
+                    continue;
+                }
+                info!(
+                    sl!(),
+                    "sb: pre-registering VFIO cold-plug device {} (from pod annotation)", path
+                );
+                let dev_info = DeviceConfig::VfioCfg(VfioConfig {
+                    host_path: path.to_string(),
+                    dev_type: "c".to_string(),
+                    bus_type: bus_type.clone(),
+                    hostdev_prefix: "vfio_device".to_owned(),
+                    ..Default::default()
+                });
+                do_handle_device(&device_manager, &dev_info)
+                    .await
+                    .context("pre-register VFIO device from pod annotation")?;
+                registered += 1;
+                info!(
+                    sl!(),
+                    "sb:coldplug annotation-registered {} (running total {})",
+                    path,
+                    registered
+                );
+            }
+        }
+        // END tactical-coldplug-shim
 
         info!(
             sl!(),
