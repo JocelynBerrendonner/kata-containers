@@ -118,6 +118,9 @@ assets:
         confidential:
           name: "ubuntu"
           version: "resolute"  # 26.04 LTS
+        mariner:
+          name: "cbl-mariner"
+          version: "3.0"
         nvidia-gpu:
           name: "ubuntu"
           version: "resolute"  # 26.04 LTS
